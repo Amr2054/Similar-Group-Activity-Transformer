@@ -1,2 +1,1 @@
 from .dataset import FIFASequenceDataset
-from .football_dataset import create_supcon_dataloader

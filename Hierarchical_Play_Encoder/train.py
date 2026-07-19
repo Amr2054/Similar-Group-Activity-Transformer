@@ -12,7 +12,7 @@ from utils import setup_logger, save_checkpoint, load_config,print_model_summary
 import random
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-from datetime import datetime
+
 
 def set_seed(seed):
     random.seed(seed)
