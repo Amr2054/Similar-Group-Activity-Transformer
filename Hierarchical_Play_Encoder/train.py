@@ -255,7 +255,7 @@ def main():
             'config': config
         }
         save_checkpoint(checkpoint, is_best, run_dir)
-        logger.info(f"Model Saved at {run_dir}")
+    logger.info(f"Model Saved at {run_dir}")
 
     writer.close() # tensorboard --logdir runs
 
