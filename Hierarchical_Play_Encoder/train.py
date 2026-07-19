@@ -1,59 +1,85 @@
+from pathlib import Path
+
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from pytorch_metric_learning import losses
-
+from pytorch_metric_learning import samplers
 
 from data import FIFASequenceDataset
 from Hierarchical_Play_Encoder.model import HierarchicalPlayEncoder
-from utils import setup_logger, save_checkpoint, load_config,print_model_summary
+from utils import setup_logger, save_checkpoint, load_config,print_model_summary,setup_run_dir
+import random
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-# def augment_play(coords, p_flip_y=0.5, p_mask_player=0.15):
-#     """ Creates a 'Positive Match' by mirroring and adding noise. """
-#     aug_coords = coords.clone()
-#     B, S, A, _ = aug_coords.shape
-#
-#     # Tactical Mirroring
-#     flip_mask = torch.rand(B) < p_flip_y
-#     aug_coords[flip_mask, :, :, 1] = aug_coords[flip_mask, :, :, 1] * -1.0
-#
-#     # Spatial Jitter
-#     noise = torch.randn_like(aug_coords) * 0.02
-#     aug_coords = aug_coords + noise
-#
-#     # Agent Dropout (protect index 22 = the ball)
-#     player_mask = torch.rand(B, 1, A, 1) > p_mask_player
-#     player_mask[:, :, 22, :] = True
-#
-#     aug_coords = aug_coords * player_mask.to(aug_coords.device)
-#     return torch.clamp(aug_coords, min=-1.0, max=1.0)
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
-def augment_play_temporal(coords, crop_size=100):
+def augment_play(features, p_flip_y=0.5, p_mask_player=0.15, jitter_std=0.02):
     """
-    Physics-informed augmentation:
-    Takes a 110-frame sequence and returns two overlapping 100-frame views.
+    features: (B, 100, 23, 9) ->
+    [x, y, z, speed, visibility, is_attacking, dist_to_goal, is_home, is_away]
     """
-    # coords shape: [Batch, 110, 23, 2]
+    aug = features.clone()
+    B = aug.shape[0]
 
-    # View 1 (Anchor): Frames 0 to 100
-    view_1 = coords[:, :crop_size, :, :]
+    # 1. Tactical mirroring on Y (index 1). dist_to_goal (index 6) is
+    # symmetric under y -> -y, so it does not need recomputing.
+    flip_mask = torch.rand(B, device=features.device) < p_flip_y
+    aug[flip_mask, :, :, 1] = aug[flip_mask, :, :, 1] * -1.0
 
-    # View 2 (Positive): Frames 10 to 110
-    view_2 = coords[:, -crop_size:, :, :]
+    # 2. Spatial jitter — only on the continuous x/y channels. Never add
+    # noise to visibility/is_attacking/is_home/is_away/dist_to_goal; they're
+    # categorical/derived and noise would corrupt their meaning.
+    noise = torch.randn_like(aug[..., 0:2]) * jitter_std
+    aug[..., 0:2] = torch.clamp(aug[..., 0:2] + noise, min=-1.0, max=1.0)
 
-    return view_1, view_2
+    # 3. Agent dropout — zero the whole 9-dim token (never the ball, index 0).
+    # This reuses the same "missing player" convention as dataGenerator, so
+    # the key_padding_mask in HierarchicalPlayEncoder picks it up for free.
+    drop_mask = torch.rand(B, 1, 23, 1, device=features.device) > p_mask_player
+    drop_mask[:, :, 0, :] = True
+    aug = aug * drop_mask
+
+    return aug
 
 def main():
     # Load configuration
-    config = load_config("Configs/hier_model_config.yaml")
-
+    config = load_config("/home/amr/Study/Courses/Deep Learning/Research Project/Footbal_sim_Transformer/Configs/hier_model_config.yaml")
+    ROOT = Path(__file__).resolve().parent
+    run_dir = setup_run_dir(ROOT)
     # Setup components using config values
-    logger = setup_logger(config['logging']['log_file'])
+    logger = setup_logger(run_dir)
+
+    SEED = config['training'].get('seed', 42)
+    set_seed(SEED)
+    logger.info(f"Global seed fixed at {SEED}")
+
+    g = torch.Generator()
+    g.manual_seed(SEED)
+
     logger.info("Initializing Training Pipeline")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Training on device: {device}")
+
+
+    writer = SummaryWriter(log_dir=run_dir)
+    global_step = 0
+
 
     # Dataset & DataLoader
     logger.info("Loading Dataset")
@@ -62,17 +88,44 @@ def main():
         match_files=config['data']['train_matches'],  # Pass training split
         target_frames=config['data']['target_frames']
     )
-    train_loader = DataLoader(train_dataset, batch_size=config['training']['batch_size'], shuffle=True, drop_last=True,
-                              num_workers=config['training']['num_workers'])
+    # print(sorted(list(train_dataset.coarse_labels)))
+    train_sampler = samplers.MPerClassSampler(
+        labels=train_dataset.coarse_label_ids,
+        m=config['training']['m_per_class'],
+        batch_size=config['training']['batch_size'],
+        length_before_new_iter=len(train_dataset)
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training']['batch_size'],
+        sampler=train_sampler,  # replaces shuffle=True — can't use both
+        drop_last=True,
+        num_workers=config['training']['num_workers'],
+        worker_init_fn=seed_worker,
+        generator=g
+    )
 
     val_dataset = FIFASequenceDataset(
         data_dir=config['data']['data_dir'],
         match_files=config['data']['val_matches'],  # Pass validation split
         target_frames=config['data']['target_frames']
     )
-    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, drop_last=True,
-                            num_workers=config['training']['num_workers'])
 
+    val_sampler = samplers.MPerClassSampler(
+        labels=val_dataset.coarse_label_ids,
+        m=config['training']['m_per_class'],
+        batch_size=config['training']['batch_size'],
+        length_before_new_iter=len(val_dataset)
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['training']['batch_size'],
+        sampler=val_sampler,  # replaces shuffle=False
+        drop_last=True,
+        num_workers=config['training']['num_workers'],
+        worker_init_fn=seed_worker,
+        generator=g
+    )
     # Model & Optimizer
     logger.info("Initializing Hierarchical Model")
     model = HierarchicalPlayEncoder(
@@ -98,43 +151,48 @@ def main():
     logger.info("\nStarting Training\n")
     best_val_loss = float('inf')
 
-    contrastive_loss_func = losses.NTXentLoss(temperature=config['training']['temperature'])
+    contrastive_loss_func = losses.SupConLoss(temperature=config['training']['temperature'])
 
     for epoch in range(config['training']['epochs']):
         model.train()
         total_loss = 0.0
 
         for batch_idx, batch in enumerate(train_loader):
-            coords = batch['coordinates'].to(device)
-            roles = batch['roles'].to(device)
+            features = batch['features'].to(device)  # (B, 100, 23, 9)
+            weak_labels = batch['label'].to(device)  # (B,) coarse label ids
 
             optimizer.zero_grad()
 
-            # Augmentation
-            # coords_view_1 = coords
-            # coords_view_2 = augment_play(coords)
-            coords_view_1, coords_view_2 = augment_play_temporal(coords)
-            roles_view = roles[:, :100, :]
+            view_1 = augment_play(features)
+            view_2 = augment_play(features)
 
-            # Model Forward Pass
             try:
-                _, proj_1 = model(coords_view_1, roles_view)
-                _, proj_2 = model(coords_view_2, roles_view)
+                _, proj_1 = model(view_1)
+                _, proj_2 = model(view_2)
             except Exception as e:
                 logger.error(f"Forward pass failed at batch {batch_idx}: {str(e)}")
                 break
 
             embeddings = torch.cat([proj_1, proj_2], dim=0)
+            batch_labels = torch.cat([weak_labels, weak_labels], dim=0)
 
-            # Create labels: so the loss knows which pairs match
-            labels = torch.arange(config['training']['batch_size']).repeat(2).to(device)
-
-            loss = contrastive_loss_func(embeddings, labels)
+            loss = contrastive_loss_func(embeddings, batch_labels)
 
             # Backward and Optimize
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['training']['clip_max_norm'])
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=config['training'].get('grad_clip', 5.0)
+            )
             optimizer.step()
+
+            with torch.no_grad():
+                embedding_std = embeddings.std(dim=0).mean().item()
+
+            writer.add_scalar('Loss/train_batch', loss.item(), global_step)
+            writer.add_scalar('Diagnostics/grad_norm', grad_norm.item(), global_step)
+            writer.add_scalar('Diagnostics/embedding_std', embedding_std, global_step) # TODO: Watch
+            global_step += 1
+
             scheduler.step()
 
             total_loss += loss.item()
@@ -147,23 +205,24 @@ def main():
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
-                coords = batch['coordinates'].to(device)
-                roles = batch['roles'].to(device)
+                features = batch['features'].to(device)  # (B, 100, 23, 9)
+                weak_labels = batch['label'].to(device)  # (B,) coarse label ids
 
-                coords_view_1, coords_view_2 = augment_play_temporal(coords)
-                roles_view = roles[:, :100, :]
+                view_1 = augment_play(features)
+                view_2 = augment_play(features)
 
                 try:
-                    _, proj_1 = model(coords_view_1, roles_view)
-                    _, proj_2 = model(coords_view_2, roles_view)
+                    _, proj_1 = model(view_1)
+                    _, proj_2 = model(view_2)
                 except Exception as e:
-                    logger.error(f"Val pass failed at batch {batch_idx}: {str(e)}")
+                    logger.error(f"Forward pass failed at batch {batch_idx}: {str(e)}")
                     break
 
                 embeddings = torch.cat([proj_1, proj_2], dim=0)
-                labels = torch.arange(config['training']['batch_size']).repeat(2).to(device)
+                batch_labels = torch.cat([weak_labels, weak_labels], dim=0)
 
-                loss = contrastive_loss_func(embeddings, labels)
+                loss = contrastive_loss_func(embeddings, batch_labels)
+
                 total_val_loss += loss.item()
 
         avg_val_loss = total_val_loss / len(val_loader)
@@ -181,6 +240,10 @@ def main():
             f"Best Val: {best_val_loss:.4f}"
         )
 
+        writer.add_scalar('Loss/train_epoch', avg_train_loss, epoch)
+        writer.add_scalar('Loss/val_epoch', avg_val_loss, epoch)
+        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+
         # Save checkpoint
         checkpoint = {
             'epoch': epoch + 1,
@@ -191,8 +254,10 @@ def main():
             'best_val_loss': best_val_loss,
             'config': config
         }
-        save_checkpoint(checkpoint, is_best, config['logging']['checkpoint_dir'])
+        save_checkpoint(checkpoint, is_best, run_dir)
+        logger.info(f"Model Saved at {run_dir}")
 
+    writer.close() # tensorboard --logdir runs
 
 
 if __name__ == "__main__":

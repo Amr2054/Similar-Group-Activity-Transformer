@@ -1,6 +1,6 @@
 data:
-  data_dir: "/kaggle/input/datasets/mostafa646/fifa-world-cup"
-  target_frames: 110
+  data_dir: "/kaggle/input/datasets/amr2054/fifawc22/Processed Tensors"
+  target_frames: 100
   train_matches:
     - "10502.pt"
     - "10503.pt"
@@ -16,14 +16,14 @@ data:
     - "10513.pt"
     - "10514.pt"
     - "10515.pt"
-    - "10516.pt"
+#    - "10516.pt"
     - "10517.pt"
     - "3812.pt"
-    - "3813.pt"
+#    - "3813.pt"
     - "3814.pt"
     - "3815.pt"
-    - "3816.pt"
-    - "3817.pt"
+#    - "3816.pt"
+#    - "3817.pt"
     - "3818.pt"
     - "3819.pt"
     - "3820.pt"
@@ -32,8 +32,8 @@ data:
     - "3823.pt"
     - "3824.pt"
     - "3825.pt"
-    - "3826.pt"
-    - "3827.pt"
+#    - "3826.pt"
+#    - "3827.pt"
     - "3828.pt"
     - "3829.pt"
     - "3830.pt"
@@ -44,29 +44,30 @@ data:
     - "3835.pt"
     - "3836.pt"
     - "3837.pt"
-    - "3838.pt"
+#    - "3838.pt"
     - "3839.pt"
     - "3840.pt"
     - "3841.pt"
     - "3842.pt"
-    - "3843.pt"
+#    - "3843.pt"
     - "3844.pt"
-
 
   val_matches:
     - "3845.pt"
-    - "3846.pt"
-    - "3847.pt"
+#    - "3846.pt"
+#    - "3847.pt"
     - "3848.pt"
     - "3849.pt"
     - "3850.pt"
-
-  test_matches:
     - "3851.pt"
     - "3852.pt"
+
+  test_matches:
     - "3853.pt"
+    - "3854.pt"
+    - "3855.pt"
     - "3857.pt"
-    - "3858.pt"
+#    - "3858.pt"
     - "3859.pt"
 
 model:
@@ -83,7 +84,6 @@ training:
   temperature: 0.1
   clip_max_norm: 1.0
   num_workers: 3
+  m_per_class: 4
+  seed: 42
 
-logging:
-  log_file: "training.log"
-  checkpoint_dir: "checkpoints"

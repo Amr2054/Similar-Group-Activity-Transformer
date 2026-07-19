@@ -57,40 +57,40 @@ class HierarchicalPlayEncoder(nn.Module):
         )
 
     def forward(self, features):
-        # coordinates: (Batch, Frames=100, Players=23, 9)
+        # features: (Batch, Frames=100, Players=23, 9)
         B, F, P, _ = features.shape
 
-        # Tokenize Features
+        # Channel 4 = visibility.
+        # Mask out agents that are missing/invisible/dropped-out so the
+        # frame encoder doesn't attend to fabricated zero-vector tokens.
+        visibility = features[..., 4]  # (B, F, P)
+        agent_padding_mask = (visibility == 0)  # True = ignore
+
         player_tokens = self.player_proj(features)
-        
-        # Frame Encoder
-        flat_frames = player_tokens.view(B * F, P, self.d_model)  # (B*F, 23, 128)
+        flat_frames = player_tokens.view(B * F, P, self.d_model) # (B*F,23,512)
+        flat_padding_mask = agent_padding_mask.view(B * F, P)  # (B*F, 23)
 
-        # Expand Frame CLS token for all B*F frames
-        frame_cls_tokens = self.frame_cls.expand(B * F, -1, -1)  # (B*F, 1, 128)
+        cls_mask = torch.zeros(B * F, 1, dtype=torch.bool, device=features.device)
+        frame_padding_mask = torch.cat([cls_mask, flat_padding_mask], dim=1)  # (B*F, P+1)
 
-        # Concatenate CLS to the start of the 23 players
-        frame_input = torch.cat([frame_cls_tokens, flat_frames], dim=1)  # (B*F, 24, 128)
+        # Safety: never let a frame mask out every single agent (would starve
+        # the CLS token's attention entirely) — unmask as a fallback.
+        # TODO: Investigate
+        fully_masked = flat_padding_mask.all(dim=1)
+        if fully_masked.any():
+            frame_padding_mask[fully_masked, 1:] = False
 
-        # Pass through Social Transformer (Players looking at players)
-        frame_out = self.frame_encoder(frame_input)  # (B*F, 24, 128)
+        frame_cls_tokens = self.frame_cls.expand(B * F, -1, -1)
+        frame_input = torch.cat([frame_cls_tokens, flat_frames], dim=1)
 
-        # Extract the CLS token (Index 0) and un-flatten back to original shape
-        frame_embeddings = frame_out[:, 0, :].view(B, F, self.d_model)  # (B, F, 128)
+        frame_out = self.frame_encoder(frame_input, src_key_padding_mask=frame_padding_mask)
+        frame_embeddings = frame_out[:, 0, :].view(B, F, self.d_model)
 
-        # Play Encoder (Temporal)
-        temporal_seq = self.pos_encoder(frame_embeddings)  # (B, F, 128)
-
-        # Expand Play CLS token
-        play_cls_tokens = self.play_cls.expand(B, -1, -1)  # (B, 1, 128)
-        temporal_input = torch.cat([play_cls_tokens, temporal_seq], dim=1)  # (B, F+1, 128)
-
-        # Pass through Temporal Transformer
-        play_out = self.play_encoder(temporal_input)  # (B, F+1, 128)
-
-        # Extract final Play Embedding from the CLS token
-        final_embedding = play_out[:, 0, :]  # (B, 128)
-
+        temporal_seq = self.pos_encoder(frame_embeddings)
+        play_cls_tokens = self.play_cls.expand(B, -1, -1)
+        temporal_input = torch.cat([play_cls_tokens, temporal_seq], dim=1)
+        play_out = self.play_encoder(temporal_input)
+        final_embedding = play_out[:, 0, :]
         projected_embedding = self.projection_head(final_embedding)
 
         return final_embedding, projected_embedding

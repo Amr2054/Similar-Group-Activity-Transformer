@@ -30,6 +30,14 @@ class FIFASequenceDataset(Dataset):
         else:
             self.all_features = torch.empty((0, self.target_frames, 23, 7))
 
+        # Derive a coarse (dense) label for contrastive training. The full
+        # compound `supcon_label` is kept for qualitative retrieval analysis,
+        # but it's too sparse (near-unique per play) to train SupCon on.
+        self.coarse_labels = [self._coarse_label(l) for l in self.all_labels]
+        unique = sorted(set(self.coarse_labels))
+        self.label_to_idx = {lbl: i for i, lbl in enumerate(unique)}
+        self.coarse_label_ids = [self.label_to_idx[l] for l in self.coarse_labels]
+
         gc.collect()
         print(f"Loaded {len(self.all_features)} total plays across {len(file_paths)} matches!")
 
@@ -58,9 +66,15 @@ class FIFASequenceDataset(Dataset):
         
         # Concatenate features -> final shape: [100, 23, 9]
         final_features = torch.cat([features, is_home, is_away], dim=-1)
-
         return {
             'features': final_features,
             'supcon_label': self.all_labels[idx],
+            'label': torch.tensor(self.coarse_label_ids[idx], dtype=torch.long),
             'sequence_id': self.all_seq_ids[idx]
         }
+
+    @staticmethod
+    def _coarse_label(full_label):
+        # "CR_I_D __ SH_S_S" -> "CR"   |   "SH_S_S" -> "SH"
+        first_event = full_label.split(" __ ")[0]
+        return first_event.split("_")[0]

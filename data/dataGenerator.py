@@ -17,7 +17,6 @@ class FIFAWC22:
         """
 
     # PHASE 1: INITIALIZATION & I/O
-
     def __init__(self, folder_path, game_id, sample_size=100, pre_buffer=10, post_buffer=3, save_Tensor = False):
         self.folder_path = folder_path
         self.game_id = game_id
@@ -31,9 +30,9 @@ class FIFAWC22:
         self.load_event_data()
         self.get_important_sequences()
         self.load_tracking_data()
-        self.sample_sequence_frames()
-        self.extract_per_frame_info()
+        self.extract_per_frame_info()  # now reads ALL raw frames, not a pre-thinned subset
         self.post_process_ball_data()
+        self.interpolate_to_fixed_length()  # NEW — replaces sample_sequence_frames()
         self.validate_extraction(sample_seq=10)
         if save_Tensor:
             self.save_to_tensor()
@@ -109,9 +108,9 @@ class FIFAWC22:
                 stadium_meta = row.get('stadiumMetadata', {})
                 atk_dir, pitch_length, pitch_width = 'R', 105.0, 68.0
                 if isinstance(stadium_meta, dict):
-                    atk_dir = stadium_meta.get('teamAttackingDirection', 'R')
-                    pitch_length = stadium_meta.get('pitchLength', 105.0)
-                    pitch_width = stadium_meta.get('pitchWidth', 68.0)
+                    atk_dir = self._safe_val(stadium_meta.get('teamAttackingDirection'), 'R')
+                    pitch_length = self._safe_val(stadium_meta.get('pitchLength'), 105.0)
+                    pitch_width = self._safe_val(stadium_meta.get('pitchWidth'), 68.0)
 
                 raw_anchors.append({
                     'sequence_id': seq_id,
@@ -271,7 +270,6 @@ class FIFAWC22:
             self.sampled_tracking_df = pd.DataFrame()
             print("Warning: No frames were left after downsampling.")
 
-
     def _build_jersey_mappings(self):
         """
         Builds jerseyNum -> playerId mapping for all players (including subs)
@@ -292,6 +290,17 @@ class FIFAWC22:
                 if 'jerseyNum' in p and 'playerId' in p:
                     self.away_jersey_map[str(p['jerseyNum'])] = p['playerId']
 
+    @staticmethod
+    def _safe_val(value, default):
+        if value is None:
+            return default
+        try:
+            if pd.isna(value):
+                return default
+        except (TypeError, ValueError):
+            pass  # not NaN-checkable (e.g. a string) -> keep as-is
+        return value
+
     # PHASE 4: FEATURE ENGINEERING (PHYSICS & NORMALIZATION)
     def extract_per_frame_info(self):
         """
@@ -305,7 +314,7 @@ class FIFAWC22:
         extracted_data = []
         
         # 2. Iterate over the sampled tracking frames per sequence
-        for _, row in self.sampled_tracking_df.iterrows():
+        for _, row in self.tracking_df.iterrows():
             seq_id = row.get('seq_id')
             video_time = row.get('videoTimeMs')
             
@@ -479,6 +488,60 @@ class FIFAWC22:
             
         print("Post-processing complete: Ball Z-values standard-scaled and speeds calculated.")
 
+    def interpolate_to_fixed_length(self):
+        """
+        Resamples every (seq_id, role, player_id) trajectory onto a shared
+        grid of exactly `sample_size` evenly-spaced timestamps per sequence,
+        via linear interpolation on real elapsed time.
+        """
+        print("Phase 4b: Interpolating all sequences onto a fixed time grid")
+        interp_cols = ['x', 'y', 'z', 'speed', 'visibility', 'is_attacking', 'dist_to_goal']
+        resampled_rows = []
+        dropped_agents = 0
+
+        for seq_id, seq_df in self.final_extracted_df.groupby('seq_id'):
+            if seq_id not in self.important_sequence_times.index:
+                continue
+            meta = self.important_sequence_times.loc[seq_id]
+            t_start, t_end = meta['start_time'] * 1000.0, meta['end_time'] * 1000.0
+            if not (t_end > t_start):
+                print(f"  -> Skipping Seq {seq_id}: degenerate window (start >= end).")
+                continue
+
+            target_times = np.linspace(t_start, t_end, self.sample_size)
+
+            for (role, player_id), group in seq_df.groupby(['role', 'player_id']):
+                valid = group.dropna(subset=['x', 'y']).sort_values('videoTimeMs')
+
+                if len(valid) == 0:
+                    dropped_agents += 1
+                    continue  # never actually tracked in this window — correctly absent
+                elif len(valid) == 1:
+                    src_t = np.array([t_start, t_end])
+                    src_vals = {c: np.repeat(valid[c].values, 2) for c in interp_cols}
+                else:
+                    src_t = valid['videoTimeMs'].values
+                    src_vals = {c: valid[c].ffill().bfill().values for c in interp_cols}
+
+                interp_feats = {c: np.interp(target_times, src_t, src_vals[c]) for c in interp_cols}
+
+                resampled_rows.append(pd.DataFrame({
+                    'seq_id': seq_id,
+                    'videoTimeMs': target_times,
+                    'role': role,
+                    'player_id': player_id,
+                    'supcon_label': group['supcon_label'].iloc[0],
+                    # 'is_home_possession': group['is_home_possession'].iloc[0],
+                    **interp_feats
+                }))
+
+        if dropped_agents:
+            print(f"  -> {dropped_agents} agent-sequences had zero valid tracking points "
+                  f"and were correctly excluded (not zero-filled).")
+
+        self.final_extracted_df = pd.concat(resampled_rows, ignore_index=True)
+        print(f"Interpolation complete. Every sequence now has exactly {self.sample_size} synchronized frames.")
+
     # PHASE 5: OUTPUT & COMPILATION
     def validate_extraction(self, sample_seq=10):
         """
@@ -526,8 +589,14 @@ class FIFAWC22:
         else:
             print(f"Sequence {sample_seq} not found in extracted data.")
             print("(Note: This is normal if Sequence 10 did not contain a target Shot, Cross, or Foul).")
-        print("-----------------------------\n")
 
+        # NaN audit — surfaces exactly which columns still have unresolved gaps.
+        numeric_cols = ['x', 'y', 'z', 'speed', 'dist_to_goal']
+        nan_report = df[numeric_cols].isna().mean() * 100
+        print("\n--- NaN Audit (% missing per column) ---")
+        print(nan_report.to_string())
+
+        print("-----------------------------\n")
 
     def save_to_tensor(self):
         """
@@ -558,7 +627,8 @@ class FIFAWC22:
 
             # Ensure strict 100-frame enforcement from the downsampler
             if len(frames) != self.sample_size:
-                print(f"  -> Skipping Seq {seq}: Expected {self.sample_size} frames, got {len(frames)}.")
+                print(f"  -> WARNING Seq {seq}: expected {self.sample_size} frames, got {len(frames)}. "
+                      f"This should not happen after interpolate_to_fixed_length() — investigate.")
                 continue
 
             # Initialize empty tensor for this specific play: [100, 23, 7]
@@ -615,17 +685,37 @@ class FIFAWC22:
 
 if __name__ == '__main__':
     game_ids = [
-        '10511', '3812', '3813', '3814', '3815', '3816', '3817', '3818',
-        '3819', '3820', '3821', '3822', '3823', '3824', '3825', '3826',
-        '3827', '3828', '3829', '3830', '3831', '10502', '10503', '10504',
-        '10505', '10507', '10509', '10512', '10513', '10514', '10515',
-        '10516', '3834', '3835', '3836', '3837', '3838', '3839', '3840',
-        '3841', '3842', '3843', '3844', '3845', '3846', '3847', '3857',
-        '3858', '3859', '3848', '3849', '3850', '3852', '3832', '3853',
-        '3854', '3855', '3856', '3851', '3833', '10508', '10506', '10517',
-        '10510'
+        # '10511', '3812', '3813', '3814',
+        # '3815', '3816', '3817', '3818',
+        # '3819', '3820', '3821', '3822',
+        # '3823', '3824', '3825', '3826',
+        # '3827', '3828', '3829', '3830',
+        # '3831', '10502', '10503', '10504',
+        # '10505', '10507', '10509','10510',
+        # '10512', '10513', '10514', '10515',
+        # '10516', '3834', '3835', '3836',
+        # '3837', '3838', '3839', '3840',
+        # '3841', '3842', '3843', '3844',
+        # '3845', '3846', '3847', '3857',
+        # '3858', '3859', '3848', '3849',
+        '3850', '3852', '3832', '3853',
+        '3854', '3855', '3856', '3851',
+        '3833', '10508', '10506', '10517',
+
     ]
-    
+
+    failed_games = []
     for gid in game_ids:
         print(f"Processing Game {gid}...")
-        FIFAWC22('FIFA World Cup 2022', gid,save_Tensor=False)
+        try:
+            FIFAWC22(
+                '/home/amr/Study/Courses/Deep Learning/Research Project/Footbal_sim_Transformer/FIFA World Cup 2022',
+                gid, save_Tensor=True)
+        except Exception as e:
+            print(f"  !! Game {gid} failed: {e}")
+            failed_games.append((gid, str(e)))
+
+    if failed_games:
+        print("\n=== Games that failed extraction ===")
+        for gid, err in failed_games:
+            print(f"  {gid}: {err}")

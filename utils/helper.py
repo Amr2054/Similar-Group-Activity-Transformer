@@ -1,5 +1,7 @@
 import time
 import os
+from datetime import datetime
+
 import yaml
 import logging
 import torch
@@ -8,24 +10,34 @@ def load_config(config_path: str):
     with open(config_path, "r") as file:
         return yaml.safe_load(file)
 
-
-def setup_logger(log_file):
-    # Create a logger that writes to both the console and a file
+def setup_logger(run_dir):
     logger = logging.getLogger("Football_Sim_Play_Encoder")
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    logger.handlers.clear()
+    logger.propagate = False
 
-    # File handler
-    fh = logging.FileHandler(log_file)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    file_handler = logging.FileHandler(run_dir / "train.log")
+    console_handler = logging.StreamHandler()
+
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
     return logger
+
+def setup_run_dir(root):
+    """Creates a timestamped run directory and returns its path."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = root / "runs" / f"{timestamp}_spleen_unetr_pp"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 def save_checkpoint(state, is_best, checkpoint_dir, filename="latest_checkpoint.pth"):
     os.makedirs(checkpoint_dir, exist_ok=True)
