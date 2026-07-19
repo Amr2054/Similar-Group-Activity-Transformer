@@ -709,7 +709,7 @@ if __name__ == '__main__':
         print(f"Processing Game {gid}...")
         try:
             FIFAWC22(
-                '/home/amr/Study/Courses/Deep Learning/Research Project/Footbal_sim_Transformer/FIFA World Cup 2022',
+                '',
                 gid, save_Tensor=True)
         except Exception as e:
             print(f"  !! Game {gid} failed: {e}")

@@ -58,7 +58,7 @@ def augment_play(features, p_flip_y=0.5, p_mask_player=0.15, jitter_std=0.02):
 
 def main():
     # Load configuration
-    config = load_config("/home/amr/Study/Courses/Deep Learning/Research Project/Footbal_sim_Transformer/Configs/hier_model_config.yaml")
+    config = load_config("../Configs/hier_model_config.yaml")
     ROOT = Path(__file__).resolve().parent
     run_dir = setup_run_dir(ROOT)
     # Setup components using config values
