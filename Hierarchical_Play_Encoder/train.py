@@ -181,7 +181,7 @@ def main():
             # Backward and Optimize
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=config['training'].get('grad_clip', 5.0)
+                model.parameters(), max_norm=config['training'].get('clip_max_norm', 5.0)
             )
             optimizer.step()
 
