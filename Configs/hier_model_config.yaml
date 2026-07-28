@@ -1,5 +1,5 @@
 data:
-  data_dir: "/kaggle/input/datasets/amr2054/fifawc22/Processed Tensors"
+  data_dir: "FIFA World Cup 2022/FIFAWC22v2/Processed Tensors v2"
   target_frames: 100
   train_matches:
     - "10502.pt"
@@ -75,6 +75,8 @@ model:
   n_heads: 4
   frame_layers: 2
   play_layers: 2
+  dropout: 0.3
+  output_dim: 64
 
 training:
   batch_size: 8
@@ -86,4 +88,9 @@ training:
   num_workers: 3
   m_per_class: 4
   seed: 42
+  early_stopping_patience: 60
+  save_every: 20
 
+logging:
+  tensorboard: false
+  log_dir: "tensorboard"  # created inside each run_dir
