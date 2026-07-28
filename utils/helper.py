@@ -1,17 +1,13 @@
-import time
 import os
-from datetime import datetime
-
-import yaml
 import logging
+from datetime import datetime
+from pathlib import Path
+
 import torch
 
-def load_config(config_path: str):
-    with open(config_path, "r") as file:
-        return yaml.safe_load(file)
 
 def setup_logger(run_dir):
-    logger = logging.getLogger("Football_Sim_Play_Encoder")
+    logger = logging.getLogger("Play_Encoder_Baseline")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
@@ -32,12 +28,14 @@ def setup_logger(run_dir):
 
     return logger
 
+
 def setup_run_dir(root):
     """Creates a timestamped run directory and returns its path."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = root / "runs" / f"{timestamp}_spleen_unetr_pp"
+    run_dir = root / "runs" / f"{timestamp}_simple_baseline"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
+
 
 def save_checkpoint(state, is_best, checkpoint_dir, filename="latest_checkpoint.pth"):
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -49,27 +47,15 @@ def save_checkpoint(state, is_best, checkpoint_dir, filename="latest_checkpoint.
         torch.save(state, best_path)
 
 
-def print_model_summary(model):
-    print("\n" + "=" * 40)
-    print(f"{'MODEL SUMMARY':^40}")
-    print("=" * 40)
+def print_model_summary(model, logger=None):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    total_params = 0
-    trainable_params = 0
-
-    for name, parameter in model.named_parameters():
-        params_count = parameter.numel()
-        total_params += params_count
-        if parameter.requires_grad:
-            trainable_params += params_count
-
-    non_trainable_params = total_params - trainable_params
-
-    print(f"Total Parameters:      {total_params:,}")
-    print(f"Trainable Parameters:  {trainable_params:,}")
-    print(f"Frozen Parameters:     {non_trainable_params:,}")
-
-    if total_params > 0:
-        percent_trainable = (trainable_params / total_params) * 100
-        print(f"% Trainable:           {percent_trainable:.2f}%")
-    print("=" * 40 + "\n")
+    msg = (
+        "\n" + "=" * 40 + "\n" +
+        f"{'MODEL SUMMARY':^40}\n" + "=" * 40 + "\n" +
+        f"Total Parameters:      {total_params:,}\n" +
+        f"Trainable Parameters:  {trainable_params:,}\n" +
+        "=" * 40
+    )
+    (logger.info if logger else print)(msg)
