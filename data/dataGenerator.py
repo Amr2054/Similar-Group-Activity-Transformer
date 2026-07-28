@@ -17,7 +17,7 @@ class FIFAWC22:
         """
 
     # PHASE 1: INITIALIZATION & I/O
-    def __init__(self, folder_path, game_id, sample_size=100, pre_buffer=10, post_buffer=3, save_Tensor = False):
+    def __init__(self, folder_path, game_id, sample_size=100, pre_buffer=10, post_buffer=3, save_Tensor = False, save_folder="Processed Tensors"):
         self.folder_path = folder_path
         self.game_id = game_id
 
@@ -25,8 +25,11 @@ class FIFAWC22:
         self.sample_size = sample_size
         self.pre_buffer = pre_buffer
         self.post_buffer = post_buffer
-
+        self.save_folder = save_folder
         # Execute the pipeline sequentially
+        self.PLAYER_MAX_SPEED = 12.0
+        self.BALL_MAX_SPEED = 35.0  # a well-struck shot can exceed 30 m/s; keep this well above player speed
+
         self.load_event_data()
         self.get_important_sequences()
         self.load_tracking_data()
@@ -360,7 +363,7 @@ class FIFAWC22:
                 ball_z = bz_val if bz_val is not None else 0.0
 
                 if isinstance(raw_ball_list, list) and len(raw_ball_list) > 0:
-                    ball_vis = 1.0 if raw_ball_list[0].get('visibility') == 'VISIBLE' else 0.0
+                    ball_vis = 1.0 if raw_ball_list[0].get('visibility') in ('VISIBLE','ESTIMATED') else 0.0
                     ball_speed = raw_ball_list[0].get('speed')
                     ball_speed = ball_speed if ball_speed is not None else 0.0
 
@@ -401,10 +404,10 @@ class FIFAWC22:
                         p_x = (px_val * direction_mult) / x_scale
                         p_y = (py_val * direction_mult) / y_scale
 
-                    raw_speed = raw_p.get('speed')
+                    raw_speed = raw_p.get('speed') # TODO : Not in DOCS
                     speed = raw_speed if raw_speed is not None else 0.0
-
-                    visibility = 1.0 if raw_p.get('visibility') == 'VISIBLE' else 0.0
+                    speed = np.clip(speed, 0, self.PLAYER_MAX_SPEED)
+                    visibility = 1.0 if raw_p.get('visibility') in ('VISIBLE','ESTIMATED') else 0.0
                     is_attacking = 1.0 if is_attacking_team else 0.0
                     dist = math.hypot(1.0 - p_x, 0.0 - p_y) if pd.notna(p_x) else np.nan
 
@@ -471,7 +474,7 @@ class FIFAWC22:
         
         # Calculate speed (distance / time). Handle division by zero and NaNs for the first frames
         speed = (dist / dt_sec).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        
+        speed = np.clip(speed, 0, self.BALL_MAX_SPEED)
         # Update the original DataFrame using the aligned indices
         self.final_extracted_df.loc[ball_data.index, 'speed'] = speed
         
@@ -479,12 +482,12 @@ class FIFAWC22:
         ball_z = self.final_extracted_df.loc[ball_mask, 'z']
         z_mean = ball_z.mean()
         z_std = ball_z.std()
-        
+        # TODO: Standardization ruins range
         # Apply standard scaling (z = (x - mean) / std), protecting against division by zero
-        if pd.notna(z_std) and z_std > 0:
-            self.final_extracted_df.loc[ball_mask, 'z'] = (ball_z - z_mean) / z_std
-        else:
-            self.final_extracted_df.loc[ball_mask, 'z'] = 0.0
+        # if pd.notna(z_std) and z_std > 0:
+        #     self.final_extracted_df.loc[ball_mask, 'z'] = (ball_z - z_mean) / z_std
+        # else:
+        #     self.final_extracted_df.loc[ball_mask, 'z'] = 0.0
             
         print("Post-processing complete: Ball Z-values standard-scaled and speeds calculated.")
 
@@ -674,7 +677,7 @@ class FIFAWC22:
             'sequence_ids': seq_ids_list
         }
 
-        save_dir = f'{self.folder_path}/Processed Tensors'
+        save_dir = f'{self.folder_path}/{self.save_folder}'
         os.makedirs(save_dir, exist_ok=True)
         save_path = f'{save_dir}/{self.game_id}.pt'
 
@@ -698,9 +701,10 @@ if __name__ == '__main__':
         # '3841', '3842', '3843', '3844',
         # '3845', '3846', '3847', '3857',
         # '3858', '3859', '3848', '3849',
-        '3850', '3852', '3832', '3853',
-        '3854', '3855', '3856', '3851',
-        '3833', '10508', '10506', '10517',
+        # '3850', '3852', '3832', '3853',
+        # '3854', '3855', '3856', '3851',
+        # '3833', '10508', '10506','10517',
+
 
     ]
 
@@ -709,8 +713,8 @@ if __name__ == '__main__':
         print(f"Processing Game {gid}...")
         try:
             FIFAWC22(
-                '',
-                gid, save_Tensor=True)
+                '../FIFA World Cup 2022',
+                gid, save_Tensor=True,save_folder="Processed Tensors v2")
         except Exception as e:
             print(f"  !! Game {gid} failed: {e}")
             failed_games.append((gid, str(e)))
