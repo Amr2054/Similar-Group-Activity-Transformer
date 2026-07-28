@@ -51,7 +51,7 @@ No manual labels exist — this is why training is **self-supervised contrastive
 
 ## 2. Model Architecture
 
-![Model Architecture](Assets/Model_Arch.jpeg)
+![Model Architecture](Assets/model.png)
 
 **Input:** `coordinates (B, F, P, 2)` + `roles (B, F, P)`, where B=batch, F=frames, P=players(+ball).
 
