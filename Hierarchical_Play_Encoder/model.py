@@ -16,81 +16,101 @@ class PositionalEncoding(nn.Module):
         seq_len = x.size(1)
         return x + self.pe[:, :seq_len, :].to(x.device)
 
+class PlayEncoder(nn.Module):
+    """
+    Two-stage baseline:
+      1) Frame encoder: a standard TransformerEncoder over the 23 player
+         tokens of a single frame, pooled via a learnable [CLS] token ->
+         one embedding per frame.
+      2) Play encoder: a standard TransformerEncoder over the sequence of
+         frame embeddings (with learned positional embeddings), pooled via
+         a learnable [CLS] token -> one embedding per play.
+    """
 
-class HierarchicalPlayEncoder(nn.Module):
-    def __init__(self, d_model=128, n_heads=4, frame_layers=2, play_layers=2):
+    def __init__(self, input_dim=9, d_model=128, n_heads=4,
+                 frame_layers=2, play_layers=2, output_dim=64,
+                 max_frames=100, dropout=0.1,
+                 pos_encoding="learned"): 
         super().__init__()
         self.d_model = d_model
 
-        # Continuous Spatial Tokenizer
-        self.player_proj = nn.Sequential(
-            nn.Linear(9, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model)
-        )
+        self.pos_encoding_type = pos_encoding
+        
+        # Raw player features -> d_model
+        self.player_proj = nn.Linear(input_dim, d_model)
 
-        # Frame Encoder (Social/Spatial) - No Positional Encoding
-        self.frame_cls = nn.Parameter(torch.randn(1, 1, d_model))
+        # ---- Frame encoder (over players within a frame) ----
+        self.frame_cls = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         frame_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            batch_first=True,
-            norm_first=True
+            d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
+            dropout=dropout, batch_first=True, norm_first=True,
         )
         self.frame_encoder = nn.TransformerEncoder(frame_layer, num_layers=frame_layers)
 
-        # Play Encoder (Temporal)
-        self.pos_encoder = PositionalEncoding(d_model)
-        self.play_cls = nn.Parameter(torch.randn(1, 1, d_model))
+        # ---- Play encoder (over frames within a play) ----
+        self.play_cls = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        
+        if pos_encoding == "learned":
+            self.pos_embedding = nn.Parameter(torch.randn(1, max_frames, d_model) * 0.02)
+            self.sinusoidal_pos = None
+        elif pos_encoding == "sinusoidal":
+            self.pos_embedding = None
+            self.sinusoidal_pos = PositionalEncoding(d_model, max_len=max_frames)
+        elif pos_encoding == "none":
+            self.pos_embedding = None
+            self.sinusoidal_pos = None
+        else:
+            raise ValueError(f"Unknown pos_encoding: {pos_encoding}")
+        
         play_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            batch_first=True,
-            norm_first=True
+            d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
+            dropout=dropout, batch_first=True, norm_first=True,
         )
         self.play_encoder = nn.TransformerEncoder(play_layer, num_layers=play_layers)
 
+        # Projection head for the contrastive loss
         self.projection_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.ReLU(),
-            nn.Linear(d_model, 64)
+            nn.Linear(d_model, output_dim),
         )
 
     def forward(self, features):
-        # coordinates: (Batch, Frames=100, Players=23, 9)
-        B, F, P, _ = features.shape
+        # features: (B, Frames, Players=23, input_dim=9)
+        B, Fr, P, _ = features.shape
 
-        # Tokenize Features
-        player_tokens = self.player_proj(features)
+        # Channel 4 = visibility. Mask out missing/invisible agents.
+        visibility = features[..., 4]
+        padding_mask = (visibility == 0)  # (B, Fr, P), True = ignore
+
+        x = self.player_proj(features)               # (B, Fr, P, D)
+        x = x.reshape(B * Fr, P, self.d_model)
+        pad = padding_mask.reshape(B * Fr, P)
+
+        # Never mask out every player in a frame (would starve the CLS token).
+        fully_masked = pad.all(dim=1)
+        if fully_masked.any():
+            pad = pad.clone()
+            pad[fully_masked] = False
+
+        cls = self.frame_cls.expand(B * Fr, -1, -1)
+        x = torch.cat([cls, x], dim=1)                # (B*Fr, 1+P, D)
+        cls_pad = torch.zeros(B * Fr, 1, dtype=torch.bool, device=x.device)
+        pad = torch.cat([cls_pad, pad], dim=1)
+
+        x = self.frame_encoder(x, src_key_padding_mask=pad)
+        frame_embeddings = x[:, 0]                     # (B*Fr, D) take CLS output
+        frame_embeddings = frame_embeddings.reshape(B, Fr, self.d_model)
+
+        if self.pos_encoding_type == "learned":
+            frame_embeddings = frame_embeddings + self.pos_embedding[:, :Fr, :]
+        elif self.pos_encoding_type == "sinusoidal":
+            frame_embeddings = self.sinusoidal_pos(frame_embeddings)
         
-        # Frame Encoder
-        flat_frames = player_tokens.view(B * F, P, self.d_model)  # (B*F, 23, 128)
-
-        # Expand Frame CLS token for all B*F frames
-        frame_cls_tokens = self.frame_cls.expand(B * F, -1, -1)  # (B*F, 1, 128)
-
-        # Concatenate CLS to the start of the 23 players
-        frame_input = torch.cat([frame_cls_tokens, flat_frames], dim=1)  # (B*F, 24, 128)
-
-        # Pass through Social Transformer (Players looking at players)
-        frame_out = self.frame_encoder(frame_input)  # (B*F, 24, 128)
-
-        # Extract the CLS token (Index 0) and un-flatten back to original shape
-        frame_embeddings = frame_out[:, 0, :].view(B, F, self.d_model)  # (B, F, 128)
-
-        # Play Encoder (Temporal)
-        temporal_seq = self.pos_encoder(frame_embeddings)  # (B, F, 128)
-
-        # Expand Play CLS token
-        play_cls_tokens = self.play_cls.expand(B, -1, -1)  # (B, 1, 128)
-        temporal_input = torch.cat([play_cls_tokens, temporal_seq], dim=1)  # (B, F+1, 128)
-
-        # Pass through Temporal Transformer
-        play_out = self.play_encoder(temporal_input)  # (B, F+1, 128)
-
-        # Extract final Play Embedding from the CLS token
-        final_embedding = play_out[:, 0, :]  # (B, 128)
+        play_cls = self.play_cls.expand(B, -1, -1)
+        seq = torch.cat([play_cls, frame_embeddings], dim=1)  # (B, 1+Fr, D)
+        seq = self.play_encoder(seq)
+        final_embedding = seq[:, 0]                     # (B, D) play-level embedding
 
         projected_embedding = self.projection_head(final_embedding)
-
         return final_embedding, projected_embedding
